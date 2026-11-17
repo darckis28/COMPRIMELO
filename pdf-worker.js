@@ -1,189 +1,292 @@
+/* Optimize image streams and identify documents that can be converted to page images. */
 'use strict';
+importScripts('./vendor/pdf-lib.min.js');
 
-importScripts('https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js');
-
-const { PDFDocument, PDFDict, PDFRawStream, PDFArray, PDFName, PDFNumber, decodePDFRawStream } = PDFLib;
-const MiB = 1024 * 1024;
-const perfiles = {
-  equilibrada: { lado: 1800, calidad: 0.77 },
-  maxima: { lado: 1150, calidad: 0.54 }
+const { PDFDocument, PDFRawStream, PDFDict, PDFName, PDFArray, PDFNumber, decodePDFRawStream } = PDFLib;
+const profiles = {
+  balanced: { dimension: 1800, quality: 0.77 },
+  strong: { dimension: 1150, quality: 0.54 },
 };
+const maxPdfBytes = 128 * 1024 * 1024;
+const maxImagePixels = 28_000_000;
 
-const clave = nombre => PDFName.of(nombre);
-const nombrePDF = (dict, clavePDF) => dict.lookupMaybe(clave(clavePDF), PDFName)?.asString();
-const numeroPDF = (dict, clavePDF) => dict.lookupMaybe(clave(clavePDF), PDFNumber)?.asNumber();
-
-function filtros(dict) {
-  const filtro = dict.lookupMaybe(clave('Filter'), PDFName, PDFArray);
-  if (filtro instanceof PDFName) return [filtro.asString()];
-  return filtro?.asArray().map((_, i) => filtro.lookup(i, PDFName).asString()) ?? [];
+function key(name) {
+  return PDFName.of(name);
 }
 
-function jpegOriginal(objeto, tipos) {
-  if (objeto.dict.has(clave('DecodeParms')) || tipos.at(-1) !== '/DCTDecode') return;
-  if (tipos.length === 1) return objeto.contents;
-  if (tipos.length !== 2 || !['/ASCII85Decode', '/ASCIIHexDecode'].includes(tipos[0])) return;
-  const dict = objeto.dict.clone();
-  dict.set(clave('Filter'), clave(tipos[0].slice(1)));
-  return decodePDFRawStream({ dict, contents: objeto.contents }).decode();
+function getName(dict, name) {
+  return dict.lookupMaybe(key(name), PDFName)?.asString();
 }
 
-async function imagenRGB(objeto, ancho, alto, canales) {
-  const params = objeto.dict.lookupMaybe(clave('DecodeParms'), PDFDict);
-  if (params && (numeroPDF(params, 'Predictor') ?? 1) !== 1) return;
-  if (typeof DecompressionStream === 'undefined') return;
+function streamFilters(dict) {
+  const filter = dict.lookupMaybe(key('Filter'), PDFName, PDFArray);
+  if (filter instanceof PDFName) return [filter.asString()];
+  return filter?.asArray().map((_, index) => filter.lookup(index, PDFName).asString()) ?? [];
+}
 
-  const esperado = ancho * alto * canales;
-  const lector = new Blob([objeto.contents]).stream()
-    .pipeThrough(new DecompressionStream('deflate')).getReader();
-  const pixeles = new Uint8Array(esperado);
-  let posicion = 0;
+function unwrapJpeg(stream, filters) {
+  if (stream.dict.has(key('DecodeParms')) || filters.at(-1) !== '/DCTDecode') return;
+  if (filters.length === 1) return stream.contents;
+  if (filters.length !== 2 || !['/ASCII85Decode', '/ASCIIHexDecode'].includes(filters[0])) return;
+  const dict = stream.dict.clone();
+  dict.set(key('Filter'), key(filters[0].slice(1)));
+  return decodePDFRawStream({ dict, contents: stream.contents }).decode();
+}
 
+function getNumber(dict, name, fallback) {
+  return dict.lookupMaybe(key(name), PDFNumber)?.asNumber() ?? fallback;
+}
+
+function isProtected(dict) {
+  return getName(dict, 'Type') === '/Sig' ||
+    getName(dict, 'Type') === '/DocTimeStamp' ||
+    getName(dict, 'FT') === '/Sig' ||
+    dict.has(key('ByteRange')) ||
+    dict.has(key('XFA'));
+}
+
+async function inflateImage(contents, limit) {
+  const stream = new Blob([contents]).stream().pipeThrough(new DecompressionStream('deflate'));
+  const reader = stream.getReader();
+  const bytes = new Uint8Array(limit);
+  let offset = 0;
   try {
     while (true) {
-      const { value, done } = await lector.read();
-      if (done) break;
-      if (posicion + value.length > esperado) return;
-      pixeles.set(value, posicion);
-      posicion += value.length;
+      const { value, done } = await reader.read();
+      if (done) return bytes.subarray(0, offset);
+      if (offset + value.length > limit) throw new Error('Imagen demasiado grande');
+      bytes.set(value, offset);
+      offset += value.length;
     }
   } finally {
-    await lector.cancel().catch(() => {});
+    await reader.cancel().catch(() => {});
   }
-
-  if (posicion !== esperado) return;
-  const lienzo = new OffscreenCanvas(ancho, alto);
-  const contexto = lienzo.getContext('2d');
-  const imagen = contexto.createImageData(ancho, alto);
-  for (let i = 0, j = 0; i < imagen.data.length; i += 4, j += canales) {
-    imagen.data[i] = pixeles[j];
-    imagen.data[i + 1] = pixeles[j + (canales === 3 ? 1 : 0)];
-    imagen.data[i + 2] = pixeles[j + (canales === 3 ? 2 : 0)];
-    imagen.data[i + 3] = 255;
-  }
-  contexto.putImageData(imagen, 0, 0);
-  return lienzo;
 }
 
-async function reducirImagen(objeto, perfil, jpeg, tipos) {
-  const { dict, contents } = objeto;
-  if (!perfil || typeof OffscreenCanvas === 'undefined' || contents.length < 20_000) return;
-  if (numeroPDF(dict, 'BitsPerComponent') !== 8) return;
-  if (['SMask', 'Mask', 'ImageMask', 'Decode', 'SMaskInData', 'Alternates'].some(k => dict.has(clave(k)))) return;
-  const color = nombrePDF(dict, 'ColorSpace');
+function paeth(a, b, c) {
+  const estimate = a + b - c;
+  const distances = [Math.abs(estimate - a), Math.abs(estimate - b), Math.abs(estimate - c)];
+  if (distances[0] <= distances[1] && distances[0] <= distances[2]) return a;
+  return distances[1] <= distances[2] ? b : c;
+}
+
+function undoPrediction(bytes, width, height, channels, prediction) {
+  const rowSize = width * channels;
+  if (prediction === 1) {
+    if (bytes.length !== rowSize * height) throw new Error('Tamaño de imagen inesperado');
+    return bytes;
+  }
+  if (prediction === 2) {
+    if (bytes.length !== rowSize * height) throw new Error('Tamaño de imagen inesperado');
+    for (let row = 0; row < bytes.length; row += rowSize) {
+      for (let i = row + channels; i < row + rowSize; i++) bytes[i] += bytes[i - channels];
+    }
+    return bytes;
+  }
+
+  if (prediction < 10 || prediction > 15 || bytes.length !== (rowSize + 1) * height) {
+    throw new Error('Predictor de imagen incompatible');
+  }
+
+  const pixels = new Uint8Array(rowSize * height);
+  for (let y = 0; y < height; y++) {
+    const position = y * rowSize;
+    const source = position + y;
+    const filter = bytes[source];
+    if (filter > 4) throw new Error('Filtro de imagen incompatible');
+    for (let x = 0; x < rowSize; x++) {
+      const index = position + x;
+      const left = x >= channels ? pixels[index - channels] : 0;
+      const up = y ? pixels[index - rowSize] : 0;
+      const upperLeft = y && x >= channels ? pixels[index - rowSize - channels] : 0;
+      let offset = 0;
+      switch (filter) {
+        case 1: offset = left; break;
+        case 2: offset = up; break;
+        case 3: offset = (left + up) >> 1; break;
+        case 4: offset = paeth(left, up, upperLeft); break;
+      }
+      pixels[index] = bytes[source + 1 + x] + offset;
+    }
+  }
+  return pixels;
+}
+
+async function flatImage(stream, width, height, channels) {
+  const parameter = stream.dict.lookupMaybe(key('DecodeParms'), PDFDict, PDFArray);
+  if (parameter instanceof PDFArray && parameter.size() !== 1) return;
+  const config = parameter instanceof PDFArray ? parameter.lookupMaybe(0, PDFDict) : parameter;
+  const prediction = config ? getNumber(config, 'Predictor', 1) : 1;
+  if (prediction !== 1 && (
+    getNumber(config, 'Columns', 1) !== width ||
+    getNumber(config, 'Colors', 1) !== channels ||
+    getNumber(config, 'BitsPerComponent', 8) !== 8
+  )) return;
+
+  const bytes = await inflateImage(stream.contents, (width * channels + 1) * height);
+  const pixels = undoPrediction(bytes, width, height, channels, prediction);
+  const canvas = new OffscreenCanvas(width, height);
+  const context = canvas.getContext('2d');
+  const image = context.createImageData(width, height);
+  for (let i = 0, source = 0; i < image.data.length; i += 4, source += channels) {
+    image.data[i] = pixels[source];
+    image.data[i + 1] = pixels[source + (channels === 3 ? 1 : 0)];
+    image.data[i + 2] = pixels[source + (channels === 3 ? 2 : 0)];
+    image.data[i + 3] = 255;
+  }
+  context.putImageData(image, 0, 0);
+  return canvas;
+}
+
+async function replaceImage(document, reference, stream, profile) {
+  const { dict, contents } = stream;
+  if (contents.length < 20_000 || getNumber(dict, 'BitsPerComponent') !== 8) return;
+  if (['SMask', 'Mask', 'ImageMask', 'Decode', 'SMaskInData', 'Alternates'].some(name => dict.has(key(name)))) return;
+
+  const color = getName(dict, 'ColorSpace');
   if (color !== '/DeviceRGB' && color !== '/DeviceGray') return;
 
-  const ancho = numeroPDF(dict, 'Width');
-  const alto = numeroPDF(dict, 'Height');
-  if (!Number.isInteger(ancho) || !Number.isInteger(alto) || ancho < 1 || alto < 1 || ancho * alto > 28_000_000) return;
+  const width = getNumber(dict, 'Width');
+  const height = getNumber(dict, 'Height');
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1 || width * height > maxImagePixels) return;
 
-  let imagen;
-  if (jpeg) {
-    imagen = await createImageBitmap(new Blob([jpeg], { type: 'image/jpeg' }), {
-      imageOrientation: 'none', colorSpaceConversion: 'none'
+  const filters = streamFilters(dict);
+  const jpegBytes = unwrapJpeg(stream, filters);
+  let image;
+  if (jpegBytes) {
+    image = await createImageBitmap(new Blob([jpegBytes], { type: 'image/jpeg' }), {
+      imageOrientation: 'none',
+      colorSpaceConversion: 'none',
     });
-  } else if (tipos.length === 1 && tipos[0] === '/FlateDecode') {
-    imagen = await imagenRGB(objeto, ancho, alto, color === '/DeviceRGB' ? 3 : 1);
+  } else if (filters.length === 1 && filters[0] === '/FlateDecode') {
+    image = await flatImage(stream, width, height, color === '/DeviceRGB' ? 3 : 1);
   }
-  if (!imagen) return;
 
-  const escala = Math.min(1, perfil.lado / Math.max(ancho, alto));
-  const nuevoAncho = Math.max(1, Math.round(ancho * escala));
-  const nuevoAlto = Math.max(1, Math.round(alto * escala));
-  const lienzo = new OffscreenCanvas(nuevoAncho, nuevoAlto);
+  if (!image) return;
+  const scale = Math.min(profile.dimension / Math.max(width, height), 1);
+  const targetWidth = Math.max(1, Math.round(width * scale));
+  const targetHeight = Math.max(1, Math.round(height * scale));
+  const canvas = new OffscreenCanvas(targetWidth, targetHeight);
 
   try {
-    if (imagen.width !== ancho || imagen.height !== alto) return;
-    const contexto = lienzo.getContext('2d', { alpha: false });
-    contexto.imageSmoothingQuality = 'high';
-    contexto.drawImage(imagen, 0, 0, nuevoAncho, nuevoAlto);
-    const salida = await lienzo.convertToBlob({ type: 'image/jpeg', quality: perfil.calidad });
-    if (salida.type !== 'image/jpeg' || salida.size >= (jpeg?.length ?? contents.length) * 0.95) return;
+    if (image.width !== width || image.height !== height) return;
+    const context = canvas.getContext('2d', { alpha: false });
+    context.imageSmoothingQuality = 'high';
+    context.drawImage(image, 0, 0, targetWidth, targetHeight);
+    const jpeg = await canvas.convertToBlob({ type: 'image/jpeg', quality: profile.quality });
+    if (jpeg.type !== 'image/jpeg' || jpeg.size > contents.length * 0.95) return;
 
-    const nuevo = dict.clone();
-    nuevo.set(clave('Width'), PDFNumber.of(nuevoAncho));
-    nuevo.set(clave('Height'), PDFNumber.of(nuevoAlto));
-    nuevo.set(clave('ColorSpace'), clave('DeviceRGB'));
-    nuevo.set(clave('Filter'), clave('DCTDecode'));
-    nuevo.delete(clave('DecodeParms'));
-    return PDFRawStream.of(nuevo, new Uint8Array(await salida.arrayBuffer()));
+    const output = dict.clone();
+    output.set(key('Width'), PDFNumber.of(targetWidth));
+    output.set(key('Height'), PDFNumber.of(targetHeight));
+    output.set(key('ColorSpace'), key('DeviceRGB'));
+    output.set(key('Filter'), key('DCTDecode'));
+    output.delete(key('DecodeParms'));
+    document.context.assign(reference, PDFRawStream.of(output, new Uint8Array(await jpeg.arrayBuffer())));
   } finally {
-    if (typeof imagen.close === 'function') imagen.close();
-    else imagen.width = imagen.height = 1;
-    lienzo.width = lienzo.height = 1;
+    canvas.width = 1;
+    canvas.height = 1;
+    if (typeof image.close === 'function') image.close();
+    else {
+      image.width = 1;
+      image.height = 1;
+    }
   }
 }
 
-async function optimizar(blob, nivel) {
-  if (blob.size > 128 * MiB) return { nota: 'PDF grande · original' };
-  const inicio = await blob.slice(0, 1024).text();
-  if (!inicio.includes('%PDF-')) return { nota: 'Archivo ilegible · original' };
+async function compressPlainStream(document, reference, stream) {
+  if (typeof CompressionStream === 'undefined') return;
+  const { dict, contents } = stream;
+  if (contents.length < 4096 || dict.has(key('DecodeParms'))) return;
+  if (dict.has(key('Filter'))) {
+    if (getName(dict, 'Subtype') !== '/Image') return;
+    const filters = streamFilters(dict);
+    if (filters.length < 2) return;
+    const bytes = unwrapJpeg(stream, filters);
+    if (!bytes || bytes.length >= contents.length) return;
+    const output = dict.clone();
+    output.set(key('Filter'), key('DCTDecode'));
+    document.context.assign(reference, PDFRawStream.of(output, bytes));
+    return;
+  }
+  if (getName(dict, 'Type') === '/Metadata') return;
 
-  let documento;
+  const compressed = await new Response(
+    new Blob([contents]).stream().pipeThrough(new CompressionStream('deflate'))
+  ).arrayBuffer();
+
+  if (compressed.byteLength + 35 >= contents.length) return;
+  const output = dict.clone();
+  output.set(key('Filter'), key('FlateDecode'));
+  document.context.assign(reference, PDFRawStream.of(output, new Uint8Array(compressed)));
+}
+
+async function optimize(blob, mode) {
+  const head = new TextDecoder('ascii').decode(await blob.slice(0, 1024).arrayBuffer());
+  if (!head.includes('%PDF-')) return { detail: 'Archivo ilegible' };
+  if (blob.size > maxPdfBytes) return { detail: 'PDF grande', reason: 'Se conservó el original porque supera los 128 MB por documento.' };
+
+  let document;
   try {
-    documento = await PDFDocument.load(await blob.arrayBuffer(), {
-      updateMetadata: false, throwOnInvalidObject: true
+    document = await PDFDocument.load(await blob.arrayBuffer(), {
+      ignoreEncryption: false,
+      throwOnInvalidObject: true,
+      updateMetadata: false,
     });
   } catch (error) {
-    return { nota: /encrypt/i.test(error.message) ? 'PDF protegido · original' : 'PDF no compatible · original' };
+    if (/encrypt/i.test(error?.message ?? '')) return { detail: 'PDF protegido' };
+    return { detail: 'PDF no compatible' };
   }
 
-  const objetos = documento.context.enumerateIndirectObjects();
-  const protegido = documento.catalog.has(clave('Perms')) || objetos.some(([, obj]) =>
-    obj instanceof PDFDict && (
-      obj.has(clave('ByteRange')) || obj.has(clave('XFA')) ||
-      ['/Sig', '/DocTimeStamp'].includes(nombrePDF(obj, 'Type')) ||
-      nombrePDF(obj, 'FT') === '/Sig'
-    )
-  );
-  if (protegido) return { nota: 'PDF firmado o especial · original' };
+  const objects = document.context.enumerateIndirectObjects();
+  if (document.catalog.has(key('Perms')) || objects.some(([, object]) => object instanceof PDFDict && isProtected(object))) {
+    return { detail: 'PDF firmado o especial', reason: 'Se conservó el original para proteger firmas o formularios especiales.' };
+  }
 
-  for (const [referencia, objeto] of objetos) {
-    if (!(objeto instanceof PDFRawStream)) continue;
-    const { dict, contents } = objeto;
+  if (mode === 'resolution') {
+    const names = document.catalog.lookupMaybe(key('Names'), PDFDict);
+    if (document.catalog.has(key('AcroForm')) || document.catalog.has(key('Collection')) ||
+        document.catalog.has(key('AF')) || names?.has(key('EmbeddedFiles'))) {
+      return { detail: 'PDF interactivo', reason: 'Se conservó el original para mantener formularios o archivos adjuntos.' };
+    }
+    const images = objects.map(([, object]) => object).filter(object =>
+      object instanceof PDFRawStream && getName(object.dict, 'Subtype') === '/Image'
+    );
+    const bilevel = images.length > 0 && images.every(image =>
+      getNumber(image.dict, 'BitsPerComponent') === 1 && getName(image.dict, 'ColorSpace') === '/DeviceGray'
+    );
+    return { rasterize: true, bilevel };
+  }
+
+  const profile = profiles[mode];
+  for (const [ref, object] of objects) {
+    if (!(object instanceof PDFRawStream)) continue;
     try {
-      const tipos = filtros(dict);
-      if (nombrePDF(dict, 'Subtype') === '/Image') {
-        const jpeg = jpegOriginal(objeto, tipos);
-        const reducido = await reducirImagen(objeto, perfiles[nivel], jpeg, tipos);
-        if (reducido) {
-          documento.context.assign(referencia, reducido);
-          continue;
-        }
-        if (jpeg && tipos.length > 1 && jpeg.length < contents.length) {
-          const nuevo = dict.clone();
-          nuevo.set(clave('Filter'), clave('DCTDecode'));
-          documento.context.assign(referencia, PDFRawStream.of(nuevo, jpeg));
-          continue;
-        }
+      if (profile && typeof OffscreenCanvas !== 'undefined' && getName(object.dict, 'Subtype') === '/Image') {
+        await replaceImage(document, ref, object, profile);
+        if (document.context.lookup(ref) !== object) continue;
       }
-      if (tipos.length || dict.has(clave('DecodeParms')) || contents.length < 4096 ||
-          nombrePDF(dict, 'Type') === '/Metadata' || typeof CompressionStream === 'undefined') continue;
-
-      const stream = new Blob([contents]).stream().pipeThrough(new CompressionStream('deflate'));
-      const comprimido = new Uint8Array(await new Response(stream).arrayBuffer());
-      if (comprimido.length + 35 >= contents.length) continue;
-      const nuevo = dict.clone();
-      nuevo.set(clave('Filter'), clave('FlateDecode'));
-      documento.context.assign(referencia, PDFRawStream.of(nuevo, comprimido));
+      await compressPlainStream(document, ref, object);
     } catch {
-      // Si no se reconoce el formato interno, se conserva el objeto original.
+      // Keep the untouched stream if its format cannot be safely optimized.
     }
   }
 
-  const bytes = await documento.save({
+  const output = await document.save({
     addDefaultPage: false,
     updateFieldAppearances: false,
-    useObjectStreams: true
+    useObjectStreams: true,
+    objectsPerTick: Infinity,
   });
-  return bytes.length < blob.size ? { bytes } : { nota: 'Tamaño original' };
+  if (output.length < blob.size) return { bytes: output };
+  return { detail: 'Tamaño original', reason: 'El PDF original ya ocupa igual o menos espacio.' };
 }
 
-self.onmessage = async ({ data: { blob, nivel } }) => {
+self.onmessage = async ({ data: { blob, mode } }) => {
   try {
-    const resultado = await optimizar(blob, nivel);
-    self.postMessage(resultado, resultado.bytes ? [resultado.bytes.buffer] : []);
+    const result = await optimize(blob, mode);
+    self.postMessage(result, result.bytes ? [result.bytes.buffer] : []);
   } catch {
-    self.postMessage({ nota: 'PDF no compatible · original' });
+    self.postMessage({ detail: 'PDF no compatible' });
   }
 };

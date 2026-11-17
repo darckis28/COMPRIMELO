@@ -1,383 +1,399 @@
 'use strict';
 
-const $ = id => document.getElementById(id);
-const MiB = 1024 * 1024;
-const filasPorPagina = 12;
-const cola = [];
-const lectores = [];
-const formato = new Intl.NumberFormat('es-PE', { maximumFractionDigits: 1 });
-let pagina = 0;
-let tarea;
-let resultado;
-let cargando = false;
+const byId = id => document.getElementById(id);
+const svgNS = 'http://www.w3.org/2000/svg';
+const items = [];
+const archives = [];
+const notices = [];
+const pageSize = 12;
+const zipFilename = 'PDF-comprimidos.zip';
+const zipWorkerUrl = new URL('./zip-download-worker.js', document.baseURI);
+const zipService = navigator.serviceWorker;
+const hasZipWorker = () => zipService?.controller?.scriptURL === zipWorkerUrl.href;
+const zipWorkerReady = zipService && navigator.storage?.getDirectory
+  ? prepareZipWorker() : Promise.resolve(false);
+const format = new Intl.NumberFormat('es-PE', { maximumFractionDigits: 1 });
+let page = 0;
+let importing = false;
+let job = null;
+let nextID = 0;
+let completed;
+let objectURL;
+let dragDepth = 0;
+let progressFrame = null;
 
-function peso(bytes) {
-  if (bytes >= MiB) return formato.format(bytes / MiB) + ' MB';
-  if (bytes >= 1024) return formato.format(bytes / 1024) + ' KB';
-  return bytes + ' B';
-}
+const elements = {};
+for (const id of [
+  'dropzone', 'choose', 'files', 'notices', 'count', 'queue-summary', 'clear', 'empty', 'queue',
+  'pagination', 'prev', 'next', 'page-indicator', 'profiles', 'start', 'cancel', 'progress-wrap',
+  'progress-text', 'progress-percent', 'progress', 'result', 'result-summary', 'download', 'announcement',
+  'resolution-options', 'resolution',
+]) elements[id] = byId(id);
 
-function aviso(mensaje = '') {
-  $('avisos').textContent = mensaje;
-  $('avisos').hidden = !mensaje;
-}
-
-function rutaSegura(nombre) {
-  return nombre.replaceAll('\\', '/').split('/')
-    .filter(p => p && p !== '.' && p !== '..')
-    .map(p => {
-      const limpio = p.replace(/[<>:"|?*\x00-\x1f]/g, '_').replace(/[. ]+$/, '') || '_';
-      return /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(limpio) ? '_' + limpio : limpio;
-    })
-    .join('/');
-}
-
-function nombreUnico(nombre, usados) {
-  const base = rutaSegura(nombre) || 'documento.pdf';
-  let salida = base;
-  for (let n = 2; usados.has(salida.normalize('NFC').toLowerCase()); n++) {
-    salida = base.slice(0, -4) + ' (' + n + ')' + base.slice(-4);
+function labelBytes(bytes) {
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let level = 0;
+  while (value >= 1024 && level < units.length - 1) {
+    value /= 1024;
+    level++;
   }
-  usados.add(salida.normalize('NFC').toLowerCase());
-  return salida;
+  return format.format(value) + ' ' + units[level];
 }
 
-function dibujar() {
-  const paginas = Math.max(1, Math.ceil(cola.length / filasPorPagina));
-  pagina = Math.max(0, Math.min(pagina, paginas - 1));
-  $('resumen').textContent = cargando ? 'Leyendo archivos…' :
-    cola.length ? formato.format(cola.length) + ' PDF en el lote' : 'Todavía no hay archivos.';
-  $('elegir').disabled = cargando || !!tarea;
-  $('comprimir').disabled = cargando || !!tarea || !cola.length || !window.zip || !!resultado?.guardando;
-  $('nivel').disabled = !!tarea;
-  $('vaciar').hidden = !cola.length || !!tarea || cargando;
-  $('vaciar').disabled = !!resultado?.guardando;
-  $('cancelar').hidden = !tarea;
-  $('cancelar').disabled = tarea?.signal.aborted ?? false;
-  $('paginas').hidden = paginas === 1;
-  $('pagina').textContent = `${pagina + 1} de ${paginas}`;
-  $('anterior').disabled = pagina === 0;
-  $('siguiente').disabled = pagina === paginas - 1;
-
-  const inicio = pagina * filasPorPagina;
-  $('lista').replaceChildren(...cola.slice(inicio, inicio + filasPorPagina).map(item => {
-    const li = document.createElement('li');
-    const nombre = document.createElement('span');
-    const estado = document.createElement('small');
-    nombre.textContent = item.salida || item.nombre;
-    estado.textContent = item.estado || peso(item.tamano);
-    li.append(nombre, estado);
-    return li;
-  }));
+function icon(name) {
+  const svg = document.createElementNS(svgNS, 'svg');
+  svg.classList.add('icon');
+  svg.setAttribute('aria-hidden', 'true');
+  const use = document.createElementNS(svgNS, 'use');
+  use.setAttribute('href', '#' + name);
+  svg.append(use);
+  return svg;
 }
 
-function quitarResultado() {
-  if (resultado) {
-    const anterior = resultado;
+function element(tag, classes, label) {
+  const node = document.createElement(tag);
+  if (classes) node.className = classes;
+  if (label !== undefined) node.textContent = label;
+  return node;
+}
+
+function describeStatus(item) {
+  const size = item.size;
+  switch (item.status) {
+    case 'working': return ['Procesando', ''];
+    case 'compressed': {
+      const reduction = size ? (size - item.outputSize) / size * 100 : 0;
+      return ['−' + format.format(reduction) + ' %', 'success'];
+    }
+    case 'original': return [item.detail ?? 'Original', item.detail === 'Tamaño original' ? '' : 'warning'];
+    case 'error': return ['No incluido', 'warning'];
+    default: return ['En espera', ''];
+  }
+}
+
+function fileRow(item) {
+  const row = element('li');
+  const fileIcon = element('span', 'file-icon');
+  fileIcon.append(icon('file'));
+  const metadata = element('div');
+  const name = element('span', 'file-name', item.outputName ?? item.name);
+  name.title = item.outputName ?? item.name;
+  const sizes = item.status === 'compressed' ? labelBytes(item.size) + ' → ' + labelBytes(item.outputSize) : labelBytes(item.size);
+  const notes = item.dpi ? item.dpi + ' ppp' : item.reason;
+  const info = element('span', 'file-size', sizes + (notes ? ' · ' + notes : ''));
+  metadata.append(name, info);
+  const [text, variant] = describeStatus(item);
+  const status = element('span', 'file-state ' + variant, text);
+  if (item.reason) status.title = item.reason;
+  row.append(fileIcon, metadata, status);
+  if (!job && !importing) {
+    const remove = element('button', 'remove-file');
+    remove.type = 'button';
+    remove.dataset.remove = String(item.id);
+    remove.setAttribute('aria-label', 'Quitar ' + item.name);
+    remove.append(icon('close'));
+    row.append(remove);
+  }
+  return row;
+}
+
+function renderQueue() {
+  const count = items.length;
+  const pages = Math.max(1, Math.ceil(count / pageSize));
+  page = Math.max(0, Math.min(page, pages - 1));
+  elements.count.textContent = format.format(count);
+  const size = items.reduce((total, item) => total + item.size, 0);
+  elements['queue-summary'].textContent = count
+    ? format.format(count) + ' PDF' + ' · ' + labelBytes(size) + ' en total'
+    : 'Aquí verás tus documentos y su estado.';
+  if (importing) elements['queue-summary'].textContent = 'Leyendo archivos…';
+
+  const offset = page * pageSize;
+  elements.queue.replaceChildren(...items.slice(offset, offset + pageSize).map(fileRow));
+  elements.queue.hidden = !count;
+  elements.empty.hidden = !!count;
+  elements.clear.hidden = !count || !!job || importing;
+  elements.pagination.hidden = pages === 1;
+  elements.prev.disabled = page === 0;
+  elements.next.disabled = page === pages - 1;
+  elements['page-indicator'].textContent = 'Página ' + (page + 1) + ' de ' + pages;
+}
+
+function renderControls() {
+  elements.choose.disabled = !!job || importing;
+  elements.start.disabled = !items.length || !!job || importing;
+  elements.profiles.disabled = !!job;
+  elements['resolution-options'].hidden = elements.profiles.querySelector('input:checked').value !== 'resolution';
+  elements.cancel.hidden = !job;
+  elements.cancel.disabled = job?.signal.aborted ?? false;
+}
+
+function renderNotices() {
+  elements.notices.hidden = !notices.length;
+  const list = element('ul');
+  for (const notice of notices.slice(0, 5)) list.append(element('li', '', notice));
+  if (notices.length > 5) list.append(element('li', '', 'Y ' + (notices.length - 5) + ' avisos más.'));
+  elements.notices.replaceChildren(list);
+}
+
+function refresh() {
+  renderControls();
+  renderQueue();
+  renderNotices();
+}
+
+function say(message) {
+  elements.announcement.textContent = message;
+}
+
+function clearResult() {
+  if (completed?.blob) {
+    const url = objectURL;
+    const result = completed;
+    // Give browser downloads time to open the Blob before releasing storage.
     setTimeout(() => {
-      URL.revokeObjectURL(anterior.url);
-      void anterior.liberar?.();
+      if (url) URL.revokeObjectURL(url);
+      void result?.release?.();
     }, 60_000);
   }
-  resultado = undefined;
-  $('resultado').hidden = true;
-  $('estado-descarga').textContent = '';
-  $('descargar').removeAttribute('href');
-  $('descarga-directa').removeAttribute('href');
+  completed = undefined;
+  objectURL = undefined;
+  elements.result.hidden = true;
+  elements.download.removeAttribute('href');
+  elements['progress-wrap'].hidden = true;
 }
 
-async function agregar(archivos) {
-  if (!archivos.length || tarea || cargando || resultado?.guardando) return;
-  quitarResultado();
-  aviso();
-  $('estado').textContent = '';
-  cargando = true;
-  dibujar();
+function resetStatuses() {
+  for (const item of items) {
+    item.status = undefined;
+    item.outputSize = undefined;
+    item.outputName = undefined;
+    item.detail = undefined;
+    item.dpi = undefined;
+    item.reason = undefined;
+  }
+}
 
-  const avisos = [];
+function archiveMessage(file) {
+  return 'No se pudo abrir «' + file.name + '». Verifica que sea un ZIP válido.';
+}
+
+async function addFiles(files) {
+  if (!files.length || job || importing) return;
+  clearResult();
+  resetStatuses();
+  importing = true;
+  notices.length = 0;
+  refresh();
+  let ignored = 0;
+  let added = 0;
   try {
-    for (const archivo of archivos) {
-      if (/\.pdf$/i.test(archivo.name)) {
-        cola.push({ archivo, nombre: archivo.name, tamano: archivo.size });
-      } else if (/\.zip$/i.test(archivo.name) && window.zip) {
-        const lector = new zip.ZipReader(new zip.BlobReader(archivo), {
-          useWebWorkers: false, strictness: 'balanced'
-        });
+    for (const file of files) {
+      if (/\.pdf$/i.test(file.name)) {
+        items.push({ id: nextID++, name: PdfBatch.safePath(file.name), size: file.size, file });
+        added++;
+      } else if (/\.zip$/i.test(file.name)) {
         try {
-          const entradas = (await lector.getEntries()).filter(entrada =>
-            !entrada.directory && /\.pdf$/i.test(entrada.filename) &&
-            !/(?:^|[\\/])(?:__MACOSX[\\/]|\._)/.test(entrada.filename)
-          );
-          if (!entradas.length) {
-            avisos.push(`${archivo.name} no contiene PDF.`);
-            await lector.close();
-            continue;
-          }
-          lectores.push(lector);
-          for (const entrada of entradas) {
-            cola.push({ entrada, nombre: entrada.filename, tamano: entrada.uncompressedSize });
+          const archive = await PdfBatch.getArchive(file);
+          if (!archive.entries.length) {
+            await archive.close();
+            notices.push('El ZIP «' + file.name + '» no contiene PDF.');
+          } else {
+            archives.push(archive);
+            for (const entry of archive.entries) {
+              items.push({
+                id: nextID++, name: PdfBatch.safePath(entry.filename),
+                size: Number.isSafeInteger(entry.uncompressedSize) && entry.uncompressedSize >= 0 ? entry.uncompressedSize : 0,
+                entry,
+              });
+              added++;
+            }
           }
         } catch {
-          await lector.close().catch(() => {});
-          avisos.push(`No se pudo abrir ${archivo.name}.`);
+          notices.push(archiveMessage(file));
         }
-      } else {
-        avisos.push(`No se pudo agregar ${archivo.name}.`);
-      }
+      } else ignored++;
     }
+    if (ignored) notices.push(ignored === 1 ? 'Se omitió un archivo porque solo se admiten PDF y ZIP.' :
+      'Se omitieron ' + ignored + ' archivos porque solo se admiten PDF y ZIP.');
   } finally {
-    cargando = false;
-    aviso(avisos.slice(0, 4).join(' '));
-    dibujar();
+    importing = false;
+    if (added && items.length === added) page = 0;
+    refresh();
+    if (added) say(added === 1 ? 'Se agregó 1 PDF.' : 'Se agregaron ' + added + ' PDF.');
   }
 }
 
-async function temporal(tamano) {
-  if (tamano < 96 * MiB || !navigator.storage?.getDirectory) return null;
-  let directorio;
-  const nombre = 'comprime-pdf-' + crypto.randomUUID() + '.tmp';
-  try {
-    directorio = await navigator.storage.getDirectory();
-    const archivo = await directorio.getFileHandle(nombre, { create: true });
-    const destino = (await archivo.createWritable()).getWriter();
-    let cerrado = false;
-    const stream = new WritableStream({
-      write: bytes => destino.write(bytes),
-      async close() { await destino.close(); cerrado = true; },
-      async abort() { await destino.abort(); cerrado = true; }
+function updateProgress(done, total) {
+  const percent = Math.min(99, Math.floor(done / total * 100));
+  elements.progress.value = percent;
+  elements['progress-percent'].textContent = percent + ' %';
+  elements['progress-text'].textContent = done === total
+    ? 'Preparando la descarga…' : format.format(done) + ' de ' + format.format(total) + ' PDF procesados';
+  if (progressFrame === null) {
+    progressFrame = requestAnimationFrame(() => {
+      progressFrame = null;
+      renderQueue();
     });
-    return {
-      stream,
-      async finalizar() {
-        if (!cerrado) await stream.close();
-        return archivo.getFile();
-      },
-      async liberar() {
-        if (!cerrado) await destino.abort().catch(() => {});
-        await directorio.removeEntry(nombre).catch(() => {});
+  }
+}
+
+async function prepareZipWorker() {
+  try {
+    await zipService.register(zipWorkerUrl);
+    if (hasZipWorker()) return true;
+    return new Promise(resolve => {
+      function finish() {
+        clearTimeout(timer);
+        zipService.removeEventListener('controllerchange', finish);
+        resolve(hasZipWorker());
       }
-    };
+      const timer = setTimeout(finish, 1500);
+      zipService.addEventListener('controllerchange', finish, { once: true });
+      if (hasZipWorker()) finish();
+    });
   } catch {
-    await directorio?.removeEntry(nombre).catch(() => {});
-    return null;
+    return false;
   }
 }
 
-async function abrirPDF(item, signal) {
-  if (item.archivo) return { blob: item.archivo };
-  const entrada = item.entrada;
-  if (entrada.encrypted) throw new Error('ZIP con contraseña');
-  if (!Number.isSafeInteger(item.tamano) || item.tamano < 0) throw new Error('Tamaño inválido');
+function setZipLink(result) {
+  const link = elements.download;
+  if (result.downloadId && hasZipWorker()) {
+    // The service worker responds from browser storage with Content-Disposition: attachment.
+    link.removeAttribute('download');
+    link.href = new URL('./__comprime_pdf_descarga__/' + result.downloadId, document.baseURI).href;
+    return;
+  }
+  const blob = result.blob;
+  objectURL = URL.createObjectURL(blob.type === 'application/zip' ? blob : blob.slice(0, blob.size, 'application/zip'));
+  link.download = zipFilename;
+  link.href = objectURL;
+}
 
-  const disco = await temporal(item.tamano);
+async function run() {
+  if (!items.length || importing || job) return;
+  clearResult();
+  resetStatuses();
+  notices.length = 0;
+  job = new AbortController();
+  const { signal } = job;
+  elements['progress-wrap'].hidden = false;
+  const mode = elements.profiles.querySelector('input:checked').value;
+  updateProgress(0, items.length);
+  refresh();
+  say('Compresión iniciada.');
   try {
-    if (!disco && item.tamano > 192 * MiB) throw new Error('PDF demasiado grande para la memoria disponible');
-    const datos = await entrada.getData(disco?.stream ?? new zip.BlobWriter('application/pdf'), {
-      signal, checkSignature: true, useWebWorkers: false
-    });
-    const blob = disco ? await disco.finalizar() : datos;
-    if (blob.size !== item.tamano) throw new Error('PDF incompleto');
-    return { blob, liberar: disco?.liberar };
-  } catch (error) {
-    await disco?.liberar();
-    throw error;
-  }
-}
-
-function motorPDF() {
-  let worker;
-  return {
-    procesar(blob, nivel, signal) {
-      return new Promise((resolve, reject) => {
-        signal.throwIfAborted();
-        worker ??= new Worker('./pdf-worker.js');
-
-        function terminar(datos, error, reiniciar) {
-          clearTimeout(limite);
-          signal.removeEventListener('abort', cancelar);
-          worker.onmessage = worker.onerror = worker.onmessageerror = null;
-          if (reiniciar) {
-            worker.terminate();
-            worker = null;
-          }
-          if (error) reject(error);
-          else resolve(datos);
-        }
-
-        function cancelar() { terminar(null, signal.reason, true); }
-        const limite = setTimeout(() => terminar({ nota: 'Original conservado' }, null, true), 75_000);
-        signal.addEventListener('abort', cancelar, { once: true });
-        worker.onmessage = ({ data }) => terminar(data);
-        worker.onerror = worker.onmessageerror = () => {
-          terminar(null, new Error('No se pudo iniciar el motor de PDF.'), true);
-        };
-        try { worker.postMessage({ blob, nivel }); }
-        catch (error) { terminar(null, error, true); }
-      });
-    },
-    cerrar() { worker?.terminate(); }
-  };
-}
-
-async function comprimir() {
-  if (!cola.length || tarea || cargando || resultado?.guardando) return;
-  quitarResultado();
-  aviso();
-  tarea = new AbortController();
-  const { signal } = tarea;
-  const nivel = $('nivel').value;
-  const motor = motorPDF();
-  const usados = new Set();
-  let disco;
-  let incluidos = 0;
-  let omitidos = 0;
-  let ahorro = 0;
-
-  for (const item of cola) {
-    delete item.estado;
-    delete item.salida;
-  }
-
-  $('progreso').value = 0;
-  $('progreso').hidden = false;
-  $('estado').textContent = 'Preparando el lote…';
-  dibujar();
-
-  try {
-    const total = cola.reduce((suma, item) => suma + item.tamano, 0);
-    disco = await temporal(total);
-    const escritor = new zip.ZipWriter(disco?.stream ?? new zip.BlobWriter('application/zip'), {
-      level: 0, useWebWorkers: false
-    });
-
-    for (const [i, item] of cola.entries()) {
-      signal.throwIfAborted();
-      let entrada;
-      try {
-        entrada = await abrirPDF(item, signal);
-      } catch (error) {
-        signal.throwIfAborted();
-        item.estado = 'Omitido · ' + (item.entrada?.encrypted ? 'ZIP protegido' : 'No se pudo leer');
-        omitidos++;
-      }
-
-      if (entrada) {
-        try {
-          const respuesta = await motor.procesar(entrada.blob, nivel, signal);
-          const salida = respuesta.bytes
-            ? new Blob([respuesta.bytes], { type: 'application/pdf' })
-            : entrada.blob;
-          const nombre = nombreUnico(item.nombre, usados);
-          await escritor.add(nombre, new zip.BlobReader(salida), { signal });
-          item.salida = nombre;
-          item.estado = respuesta.bytes ? peso(entrada.blob.size) + ' → ' + peso(salida.size) : respuesta.nota;
-          ahorro += entrada.blob.size - salida.size;
-          incluidos++;
-        } finally {
-          await entrada.liberar?.();
-        }
-      }
-
-      $('progreso').value = Math.floor((i + 1) / cola.length * 99);
-      $('estado').textContent = `${i + 1} de ${cola.length} PDF procesados`;
-      if (i % 8 === 0) dibujar();
+    const localDownload = hasZipWorker() || await zipWorkerReady;
+    signal.throwIfAborted();
+    completed = await PdfBatch.process(
+      items, mode, signal, updateProgress, Number(elements.resolution.value), localDownload
+    );
+    if (!completed.blob) {
+      notices.push('No se pudo incluir ningún PDF. Revisa el estado de los archivos en la cola.');
+      say(notices[notices.length - 1]);
+      return;
     }
-
-    signal.throwIfAborted();
-    if (!incluidos) throw new Error('El lote no contiene PDF que se puedan incluir.');
-    const datos = await escritor.close();
-    const blob = disco ? await disco.finalizar() : datos;
-    signal.throwIfAborted();
-    if (!blob?.size) throw new Error('El ZIP quedó vacío.');
-
-    resultado = { blob, url: URL.createObjectURL(blob), liberar: disco?.liberar };
-    disco = undefined;
-    $('descargar').href = resultado.url;
-    $('descarga-directa').href = resultado.url;
-    $('descarga-directa').hidden = !window.showSaveFilePicker;
-    $('detalle').textContent = `${incluidos} PDF · ${peso(blob.size)} de ZIP · ${peso(ahorro)} de ahorro`;
-    $('resultado').hidden = false;
-    $('estado').textContent = 'Compresión terminada.';
-    if (omitidos) aviso(`${omitidos} PDF omitidos. Revisa el estado de la cola.`);
+    setZipLink(completed);
+    const savings = completed.input - completed.output;
+    const percentage = completed.input ? (savings / completed.input) * 100 : 0;
+    const parts = [
+      format.format(completed.included) + (completed.included === 1 ? ' PDF incluido' : ' PDF incluidos'),
+      labelBytes(completed.blob.size) + ' de ZIP',
+    ];
+    if (savings) parts.push(format.format(percentage) + ' % menos en los PDF');
+    if (completed.originals) parts.push(format.format(completed.originals) + (completed.originals === 1 ? ' original conservado' : ' originales conservados'));
+    elements['result-summary'].textContent = parts.join(' · ');
+    elements.result.hidden = false;
+    if (completed.errors) notices.push('Hay archivos que no se pudieron incluir. Revisa los marcados en la cola.');
+    elements.progress.value = 100;
+    say('ZIP listo para descargar. ' + parts.join('. ') + '.');
   } catch (error) {
-    $('estado').textContent = signal.aborted ? 'Compresión cancelada.' : '';
-    if (!signal.aborted) {
-      aviso(error.name === 'QuotaExceededError'
-        ? 'No queda espacio suficiente. Divide el lote o libera almacenamiento.'
-        : error.message || 'No se pudo generar el ZIP.');
+    if (signal.aborted) {
+      resetStatuses();
+      say('Compresión cancelada.');
+    } else {
+      notices.push(error?.name === 'QuotaExceededError'
+        ? 'El navegador se quedó sin espacio. Libera almacenamiento o divide el lote.'
+        : 'El navegador no pudo generar el ZIP. Intenta procesar un lote más pequeño.');
+      say(notices[notices.length - 1]);
     }
   } finally {
-    await disco?.liberar();
-    motor.cerrar();
-    tarea = undefined;
-    $('progreso').hidden = true;
-    dibujar();
+    job = null;
+    elements['progress-wrap'].hidden = true;
+    refresh();
   }
 }
 
-async function guardarZIP(evento) {
-  if (!resultado || !window.showSaveFilePicker) return;
-  evento.preventDefault();
-  const actual = resultado;
-  if (actual.guardando) return;
-  actual.guardando = true;
-  dibujar();
+elements.choose.addEventListener('click', () => elements.files.click());
+elements.files.addEventListener('change', () => {
+  const files = Array.from(elements.files.files);
+  elements.files.value = '';
+  void addFiles(files);
+});
 
-  try {
-    const destino = await window.showSaveFilePicker({
-      suggestedName: 'PDF-comprimidos.zip',
-      types: [{ description: 'Archivo ZIP', accept: { 'application/zip': ['.zip'] } }]
-    });
-    await actual.blob.stream().pipeTo(await destino.createWritable());
-    $('estado-descarga').textContent = 'ZIP guardado correctamente.';
-  } catch (error) {
-    if (error.name !== 'AbortError') {
-      $('estado-descarga').textContent = 'Usa «Descarga directa» para guardar el ZIP.';
-      $('descarga-directa').hidden = false;
-    }
-  } finally {
-    actual.guardando = false;
-    dibujar();
-  }
+function hasFiles(event) {
+  return event.dataTransfer?.types.includes('Files');
 }
 
-$('elegir').onclick = () => $('archivos').click();
-$('archivos').onchange = () => {
-  const archivos = [...$('archivos').files];
-  $('archivos').value = '';
-  void agregar(archivos);
-};
-$('zona').ondragover = e => {
-  e.preventDefault();
-  $('zona').classList.add('arrastrando');
-};
-$('zona').ondragleave = () => $('zona').classList.remove('arrastrando');
-$('zona').ondrop = e => {
-  e.preventDefault();
-  $('zona').classList.remove('arrastrando');
-  void agregar([...e.dataTransfer.files]);
-};
-document.addEventListener('dragover', e => {
-  if (e.dataTransfer?.types.includes('Files')) e.preventDefault();
+document.addEventListener('dragover', event => {
+  if (hasFiles(event)) event.preventDefault();
 });
-document.addEventListener('drop', e => {
-  if (e.dataTransfer?.types.includes('Files')) e.preventDefault();
+document.addEventListener('drop', event => {
+  if (hasFiles(event)) event.preventDefault();
+});
+elements.dropzone.addEventListener('dragenter', event => {
+  if (!hasFiles(event) || job || importing) return;
+  event.preventDefault();
+  dragDepth++;
+  elements.dropzone.classList.add('dragging');
+});
+elements.dropzone.addEventListener('dragleave', () => {
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (!dragDepth) elements.dropzone.classList.remove('dragging');
+});
+elements.dropzone.addEventListener('drop', event => {
+  if (!hasFiles(event)) return;
+  event.preventDefault();
+  dragDepth = 0;
+  elements.dropzone.classList.remove('dragging');
+  void addFiles(Array.from(event.dataTransfer.files));
 });
 
-$('comprimir').onclick = comprimir;
-$('cancelar').onclick = () => { tarea?.abort(); dibujar(); };
-$('descargar').addEventListener('click', guardarZIP);
-$('anterior').onclick = () => { pagina--; dibujar(); };
-$('siguiente').onclick = () => { pagina++; dibujar(); };
-$('vaciar').onclick = () => {
-  if (tarea || cargando || resultado?.guardando) return;
-  quitarResultado();
-  for (const lector of lectores.splice(0)) void lector.close().catch(() => {});
-  cola.length = 0;
-  $('estado').textContent = '';
-  aviso();
-  dibujar();
-};
-
-if (!window.zip) aviso('No se pudo cargar la biblioteca ZIP. Revisa tu conexión y recarga la página.');
-dibujar();
+elements.start.addEventListener('click', () => void run());
+elements.cancel.addEventListener('click', () => {
+  job?.abort();
+  renderControls();
+});
+elements.clear.addEventListener('click', () => {
+  if (job || importing) return;
+  clearResult();
+  for (const archive of archives.splice(0)) void archive.close().catch(() => {});
+  items.length = 0;
+  notices.length = 0;
+  refresh();
+  elements.choose.focus();
+});
+elements.queue.addEventListener('click', event => {
+  const button = event.target.closest('button[data-remove]');
+  if (!button || job || importing) return;
+  const index = items.findIndex(item => item.id === Number(button.dataset.remove));
+  if (index < 0) return;
+  items.splice(index, 1);
+  clearResult();
+  resetStatuses();
+  refresh();
+  const buttons = elements.queue.querySelectorAll('button[data-remove]');
+  (buttons[Math.min(index % pageSize, buttons.length - 1)] ?? elements.choose).focus();
+});
+elements.prev.addEventListener('click', () => { page--; renderQueue(); });
+elements.next.addEventListener('click', () => { page++; renderQueue(); });
+elements.profiles.addEventListener('change', () => {
+  if (completed) {
+    clearResult();
+    resetStatuses();
+  }
+  refresh();
+});
+refresh();

@@ -2,72 +2,131 @@
 <html lang="es">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Comprime varios PDF y descárgalos por separado en un ZIP.">
-  <title>Comprime PDF por lotes</title>
-  <link rel="stylesheet" href="./estilos.css">
-  <script defer src="https://cdn.jsdelivr.net/npm/@zip.js/zip.js@2.25.0/dist/zip-legacy.min.js"></script>
-  <script defer src="./app.js"></script>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="Comprime varios PDF en tu navegador y descárgalos por separado en un solo ZIP.">
+  <meta name="theme-color" content="#f6f7f2">
+  <title>Comprime PDF · Compresor por lotes</title>
+  <link rel="icon" href="./favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./app.css">
+  <script src="./vendor/zip.min.js" defer></script>
+  <script src="./batch.js?v=local-download" defer></script>
+  <script src="./app.js?v=local-download" defer></script>
 </head>
 <body>
-  <header class="barra">
-    <div class="contenedor barra-interior">
-      <strong>Comprime PDF</strong>
-      <span>Procesamiento local</span>
+  <svg xmlns="http://www.w3.org/2000/svg" class="symbols" aria-hidden="true">
+    <symbol id="layers" viewBox="0 0 24 24"><path d="m12 2.8 8.5 4.6L12 12 3.5 7.4 12 2.8Z M3.5 12l8.5 4.6 8.5-4.6 M3.5 16.6l8.5 4.6 8.5-4.6"/></symbol>
+    <symbol id="shield" viewBox="0 0 24 24"><path d="M12 22s7-3.5 7-10V5.6L12 3 5 5.6V12c0 6.5 7 10 7 10Z"/><path d="m9.2 12 1.9 2 3.8-4"/></symbol>
+    <symbol id="upload" viewBox="0 0 24 24"><path d="M3.5 16v3a1.5 1.5 0 0 0 1.5 1.5h14a1.5 1.5 0 0 0 1.5-1.5v-3M12 16V3.5m-5 5 5-5 5 5"/></symbol>
+    <symbol id="file" viewBox="0 0 24 24"><path d="M13 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V10Z"/><path d="M13 3v7h7M8 14h8m-8 3.5h5"/></symbol>
+    <symbol id="archive" viewBox="0 0 24 24"><path d="M4 8h16v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8ZM3 4h18v4H3zM9 12h6"/></symbol>
+    <symbol id="settings" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="8" cy="6" r="2"/><circle cx="16" cy="12" r="2"/><circle cx="10" cy="18" r="2"/></symbol>
+    <symbol id="zip" viewBox="0 0 24 24"><path d="M9 4v16M15 4v16m-9-9 3 3 3-3m0 2 3-3 3 3"/></symbol>
+    <symbol id="arrow" viewBox="0 0 24 24"><path d="M4 12h15m-6-6 6 6-6 6"/></symbol>
+    <symbol id="download" viewBox="0 0 24 24"><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3m-8-12v11m-5-5 5 5 5-5"/></symbol>
+    <symbol id="close" viewBox="0 0 24 24"><path d="m6 6 12 12M6 18 18 6"/></symbol>
+    <symbol id="info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5m0-8v.2"/></symbol>
+    <symbol id="check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+  </svg>
+
+  <header class="topbar">
+    <div class="frame topbar-inner">
+      <a class="brand" href="./" aria-label="Comprime PDF, inicio">
+        <span class="brand-icon"><svg class="icon"><use href="#layers"/></svg></span>
+        <span>Comprime<span class="brand-accent">PDF</span></span>
+      </a>
+      <span class="local-label"><svg class="icon"><use href="#shield"/></svg> Procesamiento local</span>
     </div>
   </header>
 
-  <main class="contenedor">
-    <section class="intro">
-      <h1>Comprime PDF <span>por lotes</span></h1>
-      <p>Agrega PDF sueltos o un ZIP. Descarga cada documento por separado, dentro de un solo ZIP.</p>
+  <main class="frame">
+    <section class="intro" aria-labelledby="hero-title">
+      <h1 id="hero-title">Comprime PDF <span>por lotes</span></h1>
+      <p>Agrega tus documentos, reduce su tamaño y descárgalos juntos en un ZIP.</p>
+      <ol class="steps" aria-label="Pasos">
+        <li><span>1</span> Agrega tus PDF</li>
+        <li class="step-arrow" aria-hidden="true"><svg class="icon"><use href="#arrow"/></svg></li>
+        <li><span>2</span> Comprime el lote</li>
+        <li class="step-arrow" aria-hidden="true"><svg class="icon"><use href="#arrow"/></svg></li>
+        <li><span>3</span> Descarga el ZIP</li>
+      </ol>
     </section>
 
-    <div class="columnas">
-      <section class="tarjeta" aria-labelledby="titulo-archivos">
-        <h2 id="titulo-archivos">Archivos del lote</h2>
-        <div class="zona" id="zona">
-          <strong>Arrastra tus PDF o ZIP aquí</strong>
-          <button type="button" id="elegir">Seleccionar archivos</button>
-          <input type="file" id="archivos" accept=".pdf,.zip" multiple hidden>
-        </div>
-        <div class="fila">
-          <p id="resumen">Todavía no hay archivos.</p>
-          <button type="button" id="vaciar" class="secundario" hidden>Vaciar lote</button>
-        </div>
-        <ul id="lista" aria-label="Estado de los documentos"></ul>
-        <nav id="paginas" class="fila" aria-label="Páginas de archivos" hidden>
-          <button type="button" id="anterior" class="secundario">Anterior</button>
-          <span id="pagina"></span>
-          <button type="button" id="siguiente" class="secundario">Siguiente</button>
-        </nav>
-        <p id="avisos" class="aviso" role="status" hidden></p>
-      </section>
+    <div class="workspace">
+      <div class="main-column">
+        <section class="card upload-card" aria-labelledby="upload-title">
+          <div class="card-heading">
+            <span class="heading-icon"><svg class="icon"><use href="#file"/></svg></span>
+            <div><h2 id="upload-title">Archivos del lote</h2><p>Agrega varios PDF sueltos o un ZIP con tus documentos.</p></div>
+          </div>
+          <div class="dropzone" id="dropzone">
+            <span class="upload-icon"><svg class="icon"><use href="#upload"/></svg></span>
+            <h3>Arrastra tus archivos aquí</h3>
+            <p>También puedes seleccionarlos desde tu equipo.</p>
+            <button type="button" class="button button-accent" id="choose"><svg class="icon"><use href="#file"/></svg> Seleccionar archivos</button>
+            <input id="files" type="file" accept=".pdf,.zip,application/pdf,application/zip,application/x-zip-compressed" multiple hidden>
+            <div class="file-types"><span><svg class="icon"><use href="#file"/></svg> PDF</span><span><svg class="icon"><use href="#archive"/></svg> ZIP</span></div>
+          </div>
+          <div id="notices" class="notices" role="status" hidden></div>
+        </section>
+        <section class="card queue-card" aria-labelledby="queue-title">
+          <div class="queue-heading">
+            <div><h2 id="queue-title">Cola de archivos <span id="count" class="count">0</span></h2><p id="queue-summary">Aquí verás tus documentos y su estado.</p></div>
+            <button type="button" class="text-button" id="clear" hidden>Vaciar lote</button>
+          </div>
+          <div id="empty" class="empty"><svg class="icon"><use href="#archive"/></svg> Todavía no hay documentos en el lote.</div>
+          <ul id="queue" class="queue" aria-label="Documentos del lote" hidden></ul>
+          <div id="pagination" class="pagination" hidden>
+            <button type="button" class="text-button" id="prev">Anterior</button>
+            <span id="page-indicator"></span>
+            <button type="button" class="text-button" id="next">Siguiente</button>
+          </div>
+        </section>
+      </div>
 
-      <section class="tarjeta" aria-labelledby="titulo-compresion">
-        <h2 id="titulo-compresion">Compresión</h2>
-        <label for="nivel">Nivel de compresión</label>
-        <select id="nivel">
-          <option value="equilibrada">Equilibrada</option>
-          <option value="maxima">Máxima</option>
-          <option value="sin-perdida">Sin pérdida</option>
-        </select>
-        <button type="button" id="comprimir" class="principal" disabled>Comprimir lote</button>
-        <button type="button" id="cancelar" class="secundario" hidden>Cancelar</button>
-        <progress id="progreso" max="100" value="0" aria-label="Avance" hidden></progress>
-        <p id="estado" role="status"></p>
-        <div class="resultado" id="resultado" hidden>
-          <strong>ZIP listo</strong>
-          <p id="detalle"></p>
-          <a class="boton" id="descargar" download="PDF-comprimidos.zip">Descargar ZIP</a>
-          <a id="descarga-directa" download="PDF-comprimidos.zip" hidden>Usar descarga directa</a>
-          <p id="estado-descarga" role="status"></p>
+      <aside class="side-column" aria-label="Opciones y descarga">
+        <section class="card options-card" aria-labelledby="options-title">
+          <div class="card-heading">
+            <span class="heading-icon"><svg class="icon"><use href="#settings"/></svg></span>
+            <div><h2 id="options-title">Compresión</h2><p>Elige cuánto reducir tus PDF.</p></div>
+          </div>
+          <fieldset id="profiles">
+            <legend class="sr-only">Nivel de compresión</legend>
+            <label class="option"><input type="radio" name="mode" value="balanced" checked><span><strong>Equilibrada</strong><small>Reduce el peso con buena calidad de imagen.</small></span></label>
+            <label class="option"><input type="radio" name="mode" value="strong"><span><strong>Máxima</strong><small>Archivos más ligeros, con menor nitidez en imágenes.</small></span></label>
+            <label class="option"><input type="radio" name="mode" value="resolution"><span><strong>Reducir resolución</strong><small>Para escaneos que apenas reducen su tamaño con otros modos.</small></span></label>
+            <label class="option"><input type="radio" name="mode" value="lossless"><span><strong>Sin pérdida</strong><small>Optimiza la estructura y mantiene la calidad de imagen.</small></span></label>
+            <div id="resolution-options" class="resolution-options" hidden>
+              <label for="resolution">Resolución de las páginas</label>
+              <select id="resolution" aria-describedby="resolution-note">
+                <option value="150">150 ppp · Más nitidez</option>
+                <option value="110" selected>110 ppp · Lectura en pantalla</option>
+                <option value="96">96 ppp · Menor peso</option>
+                <option value="72">72 ppp · Resolución mínima</option>
+              </select>
+              <p id="resolution-note">Las páginas se convierten en imágenes y el texto deja de ser seleccionable. Se conservan los PDF firmados, los formularios y los PDF con adjuntos.</p>
+            </div>
+          </fieldset>
+          <button type="button" class="button button-primary" id="start" disabled><svg class="icon"><use href="#zip"/></svg> Comprimir lote</button>
+          <button type="button" class="text-button cancel" id="cancel" hidden>Cancelar compresión</button>
+          <div id="progress-wrap" class="progress-wrap" hidden>
+            <div class="progress-label"><span id="progress-text">Preparando lote…</span><span id="progress-percent"></span></div>
+            <progress id="progress" value="0" max="100" aria-label="Avance de compresión"></progress>
+          </div>
+          <div class="result" id="result" hidden>
+            <div class="result-title"><svg class="icon"><use href="#check"/></svg><strong>ZIP listo</strong></div>
+            <p id="result-summary"></p>
+            <a class="button button-accent" id="download" download="PDF-comprimidos.zip"><svg class="icon"><use href="#download"/></svg> Descargar ZIP</a>
+          </div>
+        </section>
+        <div class="privacy-note">
+          <span class="privacy-icon"><svg class="icon"><use href="#shield"/></svg></span>
+          <div><strong>Tus archivos se quedan en tu equipo</strong><p>La compresión se realiza en tu navegador. Cada PDF queda separado dentro del ZIP.</p></div>
         </div>
-        <p class="nota">Tus archivos se procesan en el navegador.</p>
-      </section>
+      </aside>
     </div>
+    <p class="sr-only" id="announcement" aria-live="polite" aria-atomic="true"></p>
   </main>
 
-  <footer class="contenedor pie">Creado por <strong>Andi Aguirre</strong></footer>
+  <footer class="footer frame"><span>Comprime PDF</span><span>Creado por <strong>Andi Aguirre</strong></span></footer>
 </body>
 </html>
