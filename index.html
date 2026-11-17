@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Comprime varios PDF y descárgalos por separado en un ZIP.">
+  <title>Comprime PDF por lotes</title>
+  <link rel="stylesheet" href="./estilos.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/@zip.js/zip.js@2.25.0/dist/zip-legacy.min.js"></script>
+  <script defer src="./app.js"></script>
+</head>
+<body>
+  <header class="barra">
+    <div class="contenedor barra-interior">
+      <strong>Comprime PDF</strong>
+      <span>Procesamiento local</span>
+    </div>
+  </header>
+
+  <main class="contenedor">
+    <section class="intro">
+      <h1>Comprime PDF <span>por lotes</span></h1>
+      <p>Agrega PDF sueltos o un ZIP. Descarga cada documento por separado, dentro de un solo ZIP.</p>
+    </section>
+
+    <div class="columnas">
+      <section class="tarjeta" aria-labelledby="titulo-archivos">
+        <h2 id="titulo-archivos">Archivos del lote</h2>
+        <div class="zona" id="zona">
+          <strong>Arrastra tus PDF o ZIP aquí</strong>
+          <button type="button" id="elegir">Seleccionar archivos</button>
+          <input type="file" id="archivos" accept=".pdf,.zip" multiple hidden>
+        </div>
+        <div class="fila">
+          <p id="resumen">Todavía no hay archivos.</p>
+          <button type="button" id="vaciar" class="secundario" hidden>Vaciar lote</button>
+        </div>
+        <ul id="lista" aria-label="Estado de los documentos"></ul>
+        <nav id="paginas" class="fila" aria-label="Páginas de archivos" hidden>
+          <button type="button" id="anterior" class="secundario">Anterior</button>
+          <span id="pagina"></span>
+          <button type="button" id="siguiente" class="secundario">Siguiente</button>
+        </nav>
+        <p id="avisos" class="aviso" role="status" hidden></p>
+      </section>
+
+      <section class="tarjeta" aria-labelledby="titulo-compresion">
+        <h2 id="titulo-compresion">Compresión</h2>
+        <label for="nivel">Nivel de compresión</label>
+        <select id="nivel">
+          <option value="equilibrada">Equilibrada</option>
+          <option value="maxima">Máxima</option>
+          <option value="sin-perdida">Sin pérdida</option>
+        </select>
+        <button type="button" id="comprimir" class="principal" disabled>Comprimir lote</button>
+        <button type="button" id="cancelar" class="secundario" hidden>Cancelar</button>
+        <progress id="progreso" max="100" value="0" aria-label="Avance" hidden></progress>
+        <p id="estado" role="status"></p>
+        <div class="resultado" id="resultado" hidden>
+          <strong>ZIP listo</strong>
+          <p id="detalle"></p>
+          <a class="boton" id="descargar" download="PDF-comprimidos.zip">Descargar ZIP</a>
+          <a id="descarga-directa" download="PDF-comprimidos.zip" hidden>Usar descarga directa</a>
+          <p id="estado-descarga" role="status"></p>
+        </div>
+        <p class="nota">Tus archivos se procesan en el navegador.</p>
+      </section>
+    </div>
+  </main>
+
+  <footer class="contenedor pie">Creado por <strong>Andi Aguirre</strong></footer>
+</body>
+</html>
