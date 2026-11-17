@@ -94,11 +94,10 @@ globalThis.PdfBatch = (() => {
     }
   }
 
-  async function diskFile(bytes, force = false) {
-    if ((!force && bytes <= largeBatchBytes) || !navigator.storage?.getDirectory) return null;
+  async function diskFile(bytes) {
+    if (bytes <= largeBatchBytes || !navigator.storage?.getDirectory) return null;
     let directory;
-    const id = crypto.randomUUID();
-    const name = 'compresion-' + id + '.tmp';
+    const name = 'compresion-' + crypto.randomUUID() + '.tmp';
     try {
       const storage = await navigator.storage.getDirectory();
       directory = await storage.getDirectoryHandle('comprime-pdf', { create: true });
@@ -114,7 +113,6 @@ globalThis.PdfBatch = (() => {
       });
       return {
         stream: output,
-        id,
         closed: () => closed,
         getBlob: () => handle.getFile(),
         async release() {
@@ -128,14 +126,13 @@ globalThis.PdfBatch = (() => {
     }
   }
 
-  async function outputZip(bytes, localDownload) {
-    const temporary = await diskFile(bytes, localDownload);
+  async function outputZip(bytes) {
+    const temporary = await diskFile(bytes);
     const writer = new ZipWriter(
       temporary?.stream ?? new BlobWriter('application/zip'),
       { useWebWorkers: false, level: 0 }
     );
     return {
-      downloadId: localDownload ? temporary?.id : undefined,
       add: (path, blob, signal) => writer.add(path, new BlobReader(blob), { signal }),
       async finish() {
         const result = await writer.close();
@@ -181,12 +178,12 @@ globalThis.PdfBatch = (() => {
     };
   }
 
-  async function process(items, mode, signal, progress, dpi, localDownload = false) {
+  async function process(items, mode, signal, progress, dpi) {
     const processor = pdfProcessor();
     let archive;
     let scanCompressor;
     try {
-      archive = await outputZip(items.reduce((total, item) => total + item.size, 0), localDownload);
+      archive = await outputZip(items.reduce((total, item) => total + item.size, 0));
       const allocatePath = uniquePaths();
       const totals = { input: 0, output: 0, included: 0, errors: 0, originals: 0 };
       for (const [index, item] of items.entries()) {
@@ -256,7 +253,7 @@ globalThis.PdfBatch = (() => {
       }
       const blob = await archive.finish();
       signal.throwIfAborted();
-      return { ...totals, blob, downloadId: archive.downloadId, release: archive.release };
+      return { ...totals, blob, release: archive.release };
     } catch (error) {
       await archive?.release();
       throw error;

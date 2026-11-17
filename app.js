@@ -6,12 +6,6 @@ const items = [];
 const archives = [];
 const notices = [];
 const pageSize = 12;
-const zipFilename = 'PDF-comprimidos.zip';
-const zipWorkerUrl = new URL('./zip-download-worker.js', document.baseURI);
-const zipService = navigator.serviceWorker;
-const hasZipWorker = () => zipService?.controller?.scriptURL === zipWorkerUrl.href;
-const zipWorkerReady = zipService && navigator.storage?.getDirectory
-  ? prepareZipWorker() : Promise.resolve(false);
 const format = new Intl.NumberFormat('es-PE', { maximumFractionDigits: 1 });
 let page = 0;
 let importing = false;
@@ -26,7 +20,7 @@ const elements = {};
 for (const id of [
   'dropzone', 'choose', 'files', 'notices', 'count', 'queue-summary', 'clear', 'empty', 'queue',
   'pagination', 'prev', 'next', 'page-indicator', 'profiles', 'start', 'cancel', 'progress-wrap',
-  'progress-text', 'progress-percent', 'progress', 'result', 'result-summary', 'download', 'announcement',
+  'progress-text', 'progress-percent', 'progress', 'result', 'result-summary', 'download-link', 'announcement',
   'resolution-options', 'resolution',
 ]) elements[id] = byId(id);
 
@@ -160,7 +154,7 @@ function clearResult() {
   completed = undefined;
   objectURL = undefined;
   elements.result.hidden = true;
-  elements.download.removeAttribute('href');
+  elements['download-link'].removeAttribute('href');
   elements['progress-wrap'].hidden = true;
 }
 
@@ -239,37 +233,10 @@ function updateProgress(done, total) {
   }
 }
 
-async function prepareZipWorker() {
-  try {
-    await zipService.register(zipWorkerUrl);
-    if (hasZipWorker()) return true;
-    return new Promise(resolve => {
-      function finish() {
-        clearTimeout(timer);
-        zipService.removeEventListener('controllerchange', finish);
-        resolve(hasZipWorker());
-      }
-      const timer = setTimeout(finish, 1500);
-      zipService.addEventListener('controllerchange', finish, { once: true });
-      if (hasZipWorker()) finish();
-    });
-  } catch {
-    return false;
-  }
-}
-
-function setZipLink(result) {
-  const link = elements.download;
-  if (result.downloadId && hasZipWorker()) {
-    // The service worker responds from browser storage with Content-Disposition: attachment.
-    link.removeAttribute('download');
-    link.href = new URL('./__comprime_pdf_descarga__/' + result.downloadId, document.baseURI).href;
-    return;
-  }
-  const blob = result.blob;
-  objectURL = URL.createObjectURL(blob.type === 'application/zip' ? blob : blob.slice(0, blob.size, 'application/zip'));
-  link.download = zipFilename;
-  link.href = objectURL;
+function setZipLink(blob) {
+  const zip = blob.type === 'application/zip' ? blob : blob.slice(0, blob.size, 'application/zip');
+  objectURL = URL.createObjectURL(zip);
+  elements['download-link'].href = objectURL;
 }
 
 async function run() {
@@ -285,17 +252,15 @@ async function run() {
   refresh();
   say('Compresión iniciada.');
   try {
-    const localDownload = hasZipWorker() || await zipWorkerReady;
-    signal.throwIfAborted();
     completed = await PdfBatch.process(
-      items, mode, signal, updateProgress, Number(elements.resolution.value), localDownload
+      items, mode, signal, updateProgress, Number(elements.resolution.value)
     );
     if (!completed.blob) {
       notices.push('No se pudo incluir ningún PDF. Revisa el estado de los archivos en la cola.');
       say(notices[notices.length - 1]);
       return;
     }
-    setZipLink(completed);
+    setZipLink(completed.blob);
     const savings = completed.input - completed.output;
     const percentage = completed.input ? (savings / completed.input) * 100 : 0;
     const parts = [
